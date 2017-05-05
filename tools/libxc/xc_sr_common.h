@@ -2,6 +2,7 @@
 #define __COMMON__H
 
 #include <stdbool.h>
+#include <libvmi/libvmi.h>
 
 #include "xg_private.h"
 #include "xg_save_restore.h"
@@ -209,6 +210,7 @@ struct xc_sr_context
             unsigned long *deferred_pages;
             unsigned long nr_deferred_pages;
             xc_hypercall_buffer_t dirty_bitmap_hbuf;
+
         } save;
 
         struct /* Restore data. */
@@ -217,6 +219,7 @@ struct xc_sr_context
             struct restore_callbacks *callbacks;
 
             int send_back_fd;
+            unsigned long nr_mfns;
             unsigned long p2m_size;
             xc_hypercall_buffer_t dirty_bitmap_hbuf;
 
@@ -257,6 +260,9 @@ struct xc_sr_context
             /* Bitmap of currently populated PFNs during restore. */
             unsigned long *populated_pfns;
             xen_pfn_t max_populated_pfn;
+
+            /* List of all MFNs */
+            //xen_pfn_t mfns_to_be_sent;
 
             /* Sender has invoked verify mode on the stream. */
             bool verify;
@@ -349,6 +355,11 @@ struct xc_sr_record
     uint32_t length;
     void *data;
 };
+
+/*
+ * Create the pipes for Xen and LibVMI
+ */
+//int create_pipe( void );
 
 /*
  * Writes a split record to the stream, applying correct padding where

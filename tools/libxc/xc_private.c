@@ -25,6 +25,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <assert.h>
+//#include <time.h>
+
+//struct timespec cstart={0,0}, cend={0,0};
 
 struct xc_interface_core *xc_interface_open(xentoollog_logger *logger,
                                             xentoollog_logger *dombuild_logger,
@@ -687,6 +690,7 @@ int writev_exact(int fd, const struct iovec *iov, int iovcnt)
     struct iovec *local_iov = NULL;
     int rc = 0, iov_idx = 0, saved_errno = 0;
     ssize_t len;
+//    double elapsed_time = 0;
 
     while ( iov_idx < iovcnt )
     {
@@ -701,7 +705,14 @@ int writev_exact(int fd, const struct iovec *iov, int iovcnt)
             if ( ++iov_idx == iovcnt )
                 goto out;
 
+//        clock_gettime(CLOCK_MONOTONIC, &cstart);
+
         len = writev(fd, &iov[iov_idx], min(iovcnt - iov_idx, IOV_MAX));
+
+//        clock_gettime(CLOCK_MONOTONIC, &cend);
+//        elapsed_time = (1.0*cend.tv_sec - 1.0*cstart.tv_sec) + (1.0e-9*cend.tv_nsec - 1.0e-9*cstart.tv_nsec);
+//        fprintf(stderr, "SUNNY: the writev system call took about %.9f\n", elapsed_time);
+
         saved_errno = errno;
 
         if ( (len == -1) && (errno == EINTR) )

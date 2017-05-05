@@ -1,10 +1,51 @@
 #include <assert.h>
+#include <libxl.h>
+#include "xc_sr_common.h"
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <assert.h>
 #include <arpa/inet.h>
 
-#include "xc_sr_common.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
 
-/*
- * Writes an Image header and Domain header into the stream.
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#include <libvmi/libvmi.h>
+#include "xc_pipe.h"
+
+/* Backup VM memcpy related variables */
+unsigned nr_end_checkpoint = 0;
+
+/* LibVMI related variables */
+//#define ENABLE_LIBVMI  //comment to disable VMI
+int counter = 1;
+int buf;
+int xen_write_fd = 0;             //Linux Pipe 1
+int xen_read_fd = 0;            //Linux Pipe 2
+
+struct vmi_requirements vmi_req;
+
+/* Timer related variables */
+typedef long long NANOSECONDS;
+typedef struct timespec TIMESPEC;
+
+static inline NANOSECONDS ns_timer(void)
+{
+    TIMESPEC curr_time;
+    clock_gettime(CLOCK_MONOTONIC, &curr_time);
+    return (NANOSECONDS) (curr_time.tv_sec * 1000000000LL) +
+        (NANOSECONDS) (curr_time.tv_nsec);
+}
+
+/* Writes an Image header and Domain header into the stream.
  */
 static int write_headers(struct xc_sr_context *ctx, uint16_t guest_type)
 {
@@ -49,6 +90,7 @@ static int write_headers(struct xc_sr_context *ctx, uint16_t guest_type)
 /*
  * Writes an END record into the stream.
  */
+
 static int write_end_record(struct xc_sr_context *ctx)
 {
     struct xc_sr_record end = { REC_TYPE_END, 0, NULL };
@@ -66,16 +108,6 @@ static int write_checkpoint_record(struct xc_sr_context *ctx)
     return write_record(ctx, &checkpoint);
 }
 
-/*
- * Writes a batch of memory as a PAGE_DATA record into the stream.  The batch
- * is constructed in ctx->save.batch_pfns.
- *
- * This function:
- * - gets the types for each pfn in the batch.
- * - for each pfn with real data:
- *   - maps and attempts to localise the pages.
- * - construct and writes a PAGE_DATA record into the stream.
- */
 static int write_batch(struct xc_sr_context *ctx)
 {
     xc_interface *xch = ctx->xch;
@@ -96,6 +128,8 @@ static int write_batch(struct xc_sr_context *ctx)
     };
 
     assert(nr_pfns != 0);
+
+    DPRINTF("Time at sr_bitmap_scan %lld ns", ns_timer());
 
     /* Mfns of the batch pfns. */
     mfns = malloc(nr_pfns * sizeof(*mfns));
@@ -155,6 +189,8 @@ static int write_batch(struct xc_sr_context *ctx)
     {
         guest_mapping = xenforeignmemory_map(xch->fmem,
             ctx->domid, PROT_READ, nr_pages, mfns, errors);
+        DPRINTF("Time at sr_mapping %lld ns", ns_timer());
+
         if ( !guest_mapping )
         {
             PERROR("Failed to map guest pages");
@@ -259,6 +295,10 @@ static int write_batch(struct xc_sr_context *ctx)
     /* Sanity check we have sent all the pages we expected to. */
     assert(nr_pages == 0);
     rc = ctx->save.nr_batch_pfns = 0;
+
+    /* This should actually be writev but for consistency purposes *
+     * it can be memcpy. */
+    DPRINTF("Time at sr_memcpy %lld ns", ns_timer());
 
  err:
     free(rec_pfns);
@@ -370,6 +410,9 @@ static int send_dirty_pages(struct xc_sr_context *ctx,
     DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
                                     &ctx->save.dirty_bitmap_hbuf);
 
+    DPRINTF("SR: p2m size is %ld", ctx->save.p2m_size);
+
+    DPRINTF("Time at sr_add2batch_start %lld ns", ns_timer());
     for ( p = 0, written = 0; p < ctx->save.p2m_size; ++p )
     {
         if ( !test_bit(p, dirty_bitmap) )
@@ -384,9 +427,14 @@ static int send_dirty_pages(struct xc_sr_context *ctx,
             xc_report_progress_step(xch, written, entries);
 
         ++written;
-    }
+   }
+
+    DPRINTF("Time at sr_add2batch_end %lld ns", ns_timer());
 
     rc = flush_batch(ctx);
+
+    DPRINTF("Time at sr_flushbatch_end %lld ns", ns_timer());
+
     if ( rc )
         return rc;
 
@@ -579,13 +627,99 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
     xc_interface *xch = ctx->xch;
     xc_shadow_op_stats_t stats = { 0, ctx->save.p2m_size };
     char *progress_str = NULL;
+
+#ifdef ENABLE_LIBVMI
+    char * xen_write_ff = NULL;
+    char * xen_read_ff = NULL;
+    char* start_addr = "ffff88001d669177";  //subject to change frequently
+//    char* end_addr = "ffff88001d66917b";    //subject to change frequently
+#endif
+
     int rc;
     DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
                                     &ctx->save.dirty_bitmap_hbuf);
 
+    DPRINTF("Time at sr_suspend_start %lld ns", ns_timer());
+
     rc = suspend_domain(ctx);
+
     if ( rc )
         goto out;
+
+    DPRINTF("Time at sr_suspend_end %lld ns\n", ns_timer());
+
+#ifdef ENABLE_LIBVMI
+
+    vmi_req.st_addr = malloc(sizeof(vmi_req.st_addr));
+//    vmi_req.en_addr = malloc(sizeof(vmi_req.en_addr));
+
+/*------------------------------------------------------------------------------------*/
+    /*
+     *  Convert hexa address into uint64
+     */
+    DPRINTF("Start Address: %s\n", start_addr);
+    *(vmi_req.st_addr) = 37433400;//(uint64_t) strtoul(start_addr, NULL, 16);    /* Have to get the address printed in the malloc code */
+    DPRINTF("Starting Address in unsigned long int: %" PRIu64 "\n", *(vmi_req.st_addr));
+/*
+    DPRINTF("End Address: %s\n", end_addr);
+    *(vmi_req.en_addr) = (uint64_t) strtoul(end_addr, NULL, strlen(end_addr));
+    DPRINTF("End Address in unsigned long int: %" PRIu64 "\n", *(vmi_req.en_addr));
+*/
+/*-------------------------------------------------------------------------------------*/
+    if (counter == 1)
+    {
+	xen_write_ff = "/tmp/xen_to_vmi";        //Linux Pipe
+	xen_read_ff = "/tmp/vmi_to_xen";
+        mkfifo(xen_read_ff, 0666);        //Create Pipe 2
+        xen_write_fd = open(xen_write_ff, O_WRONLY);      //Open Pipe 1 for Write
+        xen_read_fd = open(xen_read_ff, O_RDONLY);      //open Pipe 2 for Read
+    }
+
+    DPRINTF("Time at sr_vmi_write %lld ns", ns_timer());
+
+    rc = write(xen_write_fd, vmi_req.st_addr, sizeof(void *));//Write start address to Pipe 1
+    fsync(xen_write_fd);
+    fprintf(stderr, "Written 1st address %" PRIu64 " Successfully!!\n", *(vmi_req.st_addr));
+
+    fprintf(stderr, "Reading from LibVMI\n");
+    rc = read(xen_read_fd, &buf, sizeof(int)); //Read Accept or Reject as 1 or 0
+    fprintf(stderr,"REMUS: Received: %d\n", buf);
+
+    DPRINTF("Time at sr_vmi_read %lld ns", ns_timer());
+
+/*--------------------------------------------------------------------------*/
+/*
+ *  Have to let the first checkpoint pass, as it doesn't send the vcpu information
+ */
+
+    if (!buf && counter == 2)
+    {
+        fprintf(stderr,"REMUS: FAILING OVER HERE: %d\n", buf);
+        close(xen_write_fd);
+        close(xen_read_fd);
+        unlink(xen_read_ff);
+        free (vmi_req.st_addr);
+        free (vmi_req.en_addr);
+        fprintf(stderr, "REMUS: Suspending domain");
+
+        return 100;
+    }
+
+    rc = read(xen_read_fd, &buf, sizeof(int)); //Read Accept or Reject as 1 or 0
+    if (!buf && counter == 2)
+    {
+        fprintf(stderr,"REMUS: FAILING OVER HERE: %d\n", buf);
+        close(xen_write_fd);
+        close(xen_read_fd);
+    	unlink(xen_read_ff);
+    	free (vmi_req.st_addr);
+    	free (vmi_req.en_addr);
+        fprintf(stderr, "REMUS: Suspending domain");
+
+    	return 100;
+    }
+    counter = 2;
+#endif
 
     if ( xc_shadow_control(
              xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
@@ -620,7 +754,13 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
         }
     }
 
+    DPRINTF("SUNNY: Dirty page count is %u pages", stats.dirty_count);
+    DPRINTF("Time at sr_dirtypage_start %lld ns", ns_timer());
+
     rc = send_dirty_pages(ctx, stats.dirty_count + ctx->save.nr_deferred_pages);
+
+    DPRINTF("Time at sr_dirtypage_end %lld ns", ns_timer());
+
     if ( rc )
         goto out;
 
@@ -818,15 +958,24 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
         if ( rc )
             goto err;
 
-        if ( ctx->save.live )
+        DPRINTF("SUNNY: starting migration, suspending domain");
+
+        if ( ctx->save.live ) {
             rc = send_domain_memory_live(ctx);
-        else if ( ctx->save.checkpointed != XC_MIG_STREAM_NONE )
+            DPRINTF("SUNNY: Finished sending live memory");
+        }
+        else if ( ctx->save.checkpointed != XC_MIG_STREAM_NONE ) {
+            DPRINTF("SUNNY: starting checkpointing mechanism");
             rc = send_domain_memory_checkpointed(ctx);
+        }
         else
             rc = send_domain_memory_nonlive(ctx);
 
-        if ( rc )
-            goto err;
+        if (rc == 100)
+        {
+            rc = system ("sudo xl pause opensuse64");    //pause the primary
+            return 100;
+        }
 
         if ( !ctx->dominfo.shutdown ||
              (ctx->dominfo.shutdown_reason != SHUTDOWN_suspend) )
@@ -836,13 +985,15 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
             goto err;
         }
 
-        rc = ctx->save.ops.end_of_checkpoint(ctx);
+       rc = ctx->save.ops.end_of_checkpoint(ctx);
+       DPRINTF("SR: Number of end checkpoints sent: %u", ++nr_end_checkpoint);
+
         if ( rc )
             goto err;
 
         if ( ctx->save.checkpointed != XC_MIG_STREAM_NONE )
         {
-            /*
+           /*
              * We have now completed the initial live portion of the checkpoint
              * process. Therefore switch into periodically sending synchronous
              * batches of pages.
@@ -864,6 +1015,9 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
             }
 
             rc = ctx->save.callbacks->postcopy(ctx->save.callbacks->data);
+
+            DPRINTF("Time at sr_resume %lld ns", ns_timer());
+
             if ( rc <= 0 )
                 goto err;
 
@@ -887,16 +1041,15 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
                 goto err;
             }
         }
-    } while ( ctx->save.checkpointed != XC_MIG_STREAM_NONE );
+   } while ( ctx->save.checkpointed != XC_MIG_STREAM_NONE );
 
-    xc_report_progress_single(xch, "End of stream");
-
-    rc = write_end_record(ctx);
-    if ( rc )
+   xc_report_progress_single(xch, "End of stream");
+   rc = write_end_record(ctx);
+   if ( rc )
         goto err;
-
+    rc = 100;
     xc_report_progress_single(xch, "Complete");
-    goto done;
+   goto done;
 
  err:
     saved_errno = errno;
@@ -913,6 +1066,7 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
     }
 
     return rc;
+
 };
 
 int xc_domain_save(xc_interface *xch, int io_fd, uint32_t dom,
