@@ -212,9 +212,12 @@ struct xc_sr_context
             xc_hypercall_buffer_t dirty_bitmap_hbuf;
 
             /* Memcpy related parameters */
+            void *bckp_guest_mapping;
+            void *primary_guest_mapping;
             int read_mfns;
             uint32_t bckp_domid;
             unsigned long *bckp_mfns;
+            unsigned long *primary_mfns;
 
         } save;
 
