@@ -108,6 +108,188 @@ static int write_checkpoint_record(struct xc_sr_context *ctx)
     return write_record(ctx, &checkpoint);
 }
 
+static int memcpy_write_batch(struct xc_sr_context *ctx)
+{
+    xc_interface *xch = ctx->xch;
+    xen_pfn_t *mfns = NULL;
+    xen_pfn_t *types = NULL;
+
+    void *bckp_guest_mapping = NULL;
+    xen_pfn_t *dirtied_bckp_mfns = NULL;
+    void *bckp_page;
+    int *bckp_errors = NULL;
+
+    void *guest_mapping = NULL;
+    void **local_pages = NULL;
+    int *errors = NULL;
+    int rc = -1;
+    unsigned i, p, nr_pages = 0, nr_pages_mapped = 0;
+    unsigned nr_pfns = ctx->save.nr_batch_pfns;
+    void *page, *orig_page;
+
+    DPRINTF("Time at sr_bitmap_scan %lld ns", ns_timer());
+
+    assert(nr_pfns != 0);
+    /* Types of the batch pfns. */
+    types = malloc(nr_pfns * sizeof(*types));
+    /* Mfns of the batch pfns. */
+    mfns = malloc(nr_pfns * sizeof(*mfns));
+    /* Pointers to locally allocated pages.  Need freeing. */
+    local_pages = calloc(nr_pfns, sizeof(*local_pages));
+   /* Mfns of backup VM to memcpy to */
+    dirtied_bckp_mfns = malloc(nr_pfns * sizeof(*dirtied_bckp_mfns));
+    /* Errors from attempting to map the gfns. */
+    errors = malloc(nr_pfns * sizeof(*errors));
+    /* Errors from attempting to map the backup VM's gfns. */
+    bckp_errors = malloc(nr_pfns * sizeof(*bckp_errors));
+
+
+    if ( !mfns || !types || !errors || !bckp_errors ||
+            !local_pages || !dirtied_bckp_mfns)
+    {
+        ERROR("Unable to allocate arrays for a batch of %u pages",
+              nr_pfns);
+        goto err;
+
+    }
+
+    for ( i = 0; i < nr_pfns; ++i )
+    {
+        types[i] = mfns[i] = ctx->save.ops.pfn_to_gfn(ctx,
+                                                      ctx->save.batch_pfns[i]);
+        dirtied_bckp_mfns[i] = ctx->save.bckp_mfns[ctx->save.batch_pfns[i]];
+
+        // Likely a ballooned page.
+        if ( mfns[i] == INVALID_MFN )
+        {
+            set_bit(ctx->save.batch_pfns[i], ctx->save.deferred_pages);
+            ++ctx->save.nr_deferred_pages;
+        }
+    }
+
+    rc = xc_get_pfn_type_batch(xch, ctx->domid, nr_pfns, types);
+    if ( rc )
+    {
+        PERROR("Failed to get types for pfn batch");
+        goto err;
+    }
+    rc = -1;
+
+    for ( i = 0; i < nr_pfns; ++i )
+    {
+        switch ( types[i] )
+        {
+        case XEN_DOMCTL_PFINFO_BROKEN:
+        case XEN_DOMCTL_PFINFO_XALLOC:
+        case XEN_DOMCTL_PFINFO_XTAB:
+            continue;
+        }
+
+        dirtied_bckp_mfns[nr_pages] = dirtied_bckp_mfns[i];
+        mfns[nr_pages] = mfns[i];
+        ++nr_pages;
+    }
+
+    if ( nr_pages > 0 )
+    {
+        guest_mapping = xenforeignmemory_map(xch->fmem,
+            ctx->domid, PROT_READ, nr_pages, mfns, errors);
+        if ( !guest_mapping )
+        {
+            PERROR("Failed to map guest pages");
+            goto err;
+        }
+        nr_pages_mapped = nr_pages;
+
+        bckp_guest_mapping = xenforeignmemory_map(xch->fmem,
+            ctx->save.bckp_domid, PROT_READ | PROT_WRITE,
+                nr_pfns, ctx->save.bckp_mfns, bckp_errors);
+
+        if ( !bckp_guest_mapping )
+        {
+            PERROR("Failed to map backup VMs guest pages");
+            goto err;
+        }
+
+        DPRINTF("Time at sr_mapping %lld ns", ns_timer());
+
+        for ( i = 0, p = 0; i < nr_pfns; ++i )
+        {
+            switch ( types[i] )
+            {
+            case XEN_DOMCTL_PFINFO_BROKEN:
+            case XEN_DOMCTL_PFINFO_XALLOC:
+            case XEN_DOMCTL_PFINFO_XTAB:
+                continue;
+            }
+            if ( errors[p] )
+            {
+                ERROR("Mapping of pfn %#"PRIpfn" (mfn %#"PRIpfn") failed %d",
+                      ctx->save.batch_pfns[i], mfns[p], errors[p]);
+                goto err;
+            }
+            if ( bckp_errors[p] )
+            {
+                ERROR("Mapping of backup pfn %#"PRIpfn" (mfn %#"PRIpfn") failed %d",
+                      ctx->save.batch_pfns[i], ctx->save.bckp_mfns[p],
+                      bckp_errors[p]);
+                goto err;
+            }
+
+            orig_page = page = guest_mapping + (p * PAGE_SIZE);
+
+            rc = ctx->save.ops.normalise_page(ctx, types[i], &page);
+
+            if ( orig_page != page ) /* Only send if it is different */
+                local_pages[i] = page;
+
+            if ( rc )
+            {
+                if ( rc == -1 && errno == EAGAIN )
+                {
+                    set_bit(ctx->save.batch_pfns[i], ctx->save.deferred_pages);
+                    ++ctx->save.nr_deferred_pages;
+                    types[i] = XEN_DOMCTL_PFINFO_XTAB;
+                    --nr_pages;
+                }
+                else
+                    goto err;
+            }
+
+            else
+            {
+                    bckp_page = bckp_guest_mapping + (p * PAGE_SIZE);
+                    memcpy(bckp_page, page, PAGE_SIZE);
+                    --nr_pages;
+            }
+
+            rc = -1;
+            ++p;
+        }
+    }
+
+    /* Sanity check we have sent all the pages we expected to. */
+    assert(nr_pages == 0);
+    rc = ctx->save.nr_batch_pfns = 0;
+
+    DPRINTF("Time at sr_memcpy %lld ns", ns_timer());
+
+err:
+    if ( guest_mapping )
+        xenforeignmemory_unmap(xch->fmem, guest_mapping, nr_pages_mapped);
+    if ( bckp_guest_mapping )
+        xenforeignmemory_unmap(xch->fmem, bckp_guest_mapping, nr_pages_mapped);
+    for ( i = 0; local_pages && i < nr_pfns; ++i )
+        free(local_pages[i]);
+    free(local_pages);
+    free(errors);
+    free(bckp_errors);
+    free(types);
+    free(mfns);
+
+    return rc;
+}
+
 static int write_batch(struct xc_sr_context *ctx)
 {
     xc_interface *xch = ctx->xch;
@@ -128,8 +310,6 @@ static int write_batch(struct xc_sr_context *ctx)
     };
 
     assert(nr_pfns != 0);
-
-    DPRINTF("Time at sr_bitmap_scan %lld ns", ns_timer());
 
     /* Mfns of the batch pfns. */
     mfns = malloc(nr_pfns * sizeof(*mfns));
@@ -189,8 +369,6 @@ static int write_batch(struct xc_sr_context *ctx)
     {
         guest_mapping = xenforeignmemory_map(xch->fmem,
             ctx->domid, PROT_READ, nr_pages, mfns, errors);
-        DPRINTF("Time at sr_mapping %lld ns", ns_timer());
-
         if ( !guest_mapping )
         {
             PERROR("Failed to map guest pages");
@@ -296,10 +474,6 @@ static int write_batch(struct xc_sr_context *ctx)
     assert(nr_pages == 0);
     rc = ctx->save.nr_batch_pfns = 0;
 
-    /* This should actually be writev but for consistency purposes *
-     * it can be memcpy. */
-    DPRINTF("Time at sr_memcpy %lld ns", ns_timer());
-
  err:
     free(rec_pfns);
     if ( guest_mapping )
@@ -326,7 +500,10 @@ static int flush_batch(struct xc_sr_context *ctx)
     if ( ctx->save.nr_batch_pfns == 0 )
         return rc;
 
-    rc = write_batch(ctx);
+    if( ctx->save.read_mfns )
+        rc = memcpy_write_batch(ctx);
+    else
+        rc = write_batch(ctx);
 
     if ( !rc )
     {
@@ -614,6 +791,33 @@ static int colo_merge_secondary_dirty_bitmap(struct xc_sr_context *ctx)
 
  err:
     free(rec.data);
+    return rc;
+}
+
+/*
+ * Sunny: Read the file written by restore code.
+ */
+static int get_mfns_from_backup(struct xc_sr_context *ctx)
+{
+    FILE *file = fopen("/tmp/test.txt", "r");
+    unsigned long num, i = 0;
+    int rc = 0;
+    int a;
+    unsigned nr_pfns = ctx->save.p2m_size;
+    ctx->save.bckp_mfns = malloc(nr_pfns * sizeof(*ctx->save.bckp_mfns));
+    if ( !ctx->save.bckp_mfns )
+    {
+        rc = -1;
+        goto err;
+    }
+
+    a = fscanf(file, "%d", &ctx->save.bckp_domid);
+    while(fscanf(file, "%lu", &num) > 0) {
+        ctx->save.bckp_mfns[i] = num;
+        i++;
+    }
+    fclose(file);
+err:
     return rc;
 }
 
@@ -1041,6 +1245,19 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
                 goto err;
             }
         }
+        /*
+         *  For not sending pages through writev,
+         *  we copy the backup's pages into a file
+         *  and read those memory pages into the primary
+         */
+        //if ( ctx->save.read_mfns == 123 )
+        if ( !ctx->save.read_mfns )
+        {
+            if( get_mfns_from_backup(ctx) )
+                DPRINTF("SR: Didn't read mfns");
+            ctx->save.read_mfns = 1;
+        }
+
    } while ( ctx->save.checkpointed != XC_MIG_STREAM_NONE );
 
    xc_report_progress_single(xch, "End of stream");
@@ -1058,6 +1275,8 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
 
  done:
     cleanup(ctx);
+
+    free(ctx->save.bckp_mfns);
 
     if ( saved_rc )
     {
@@ -1100,6 +1319,7 @@ int xc_domain_save(xc_interface *xch, int io_fd, uint32_t dom,
      */
     ctx.save.max_iterations = 5;
     ctx.save.dirty_threshold = 50;
+    ctx.save.read_mfns = 0;
 
     /* Sanity checks for callbacks. */
     if ( hvm )

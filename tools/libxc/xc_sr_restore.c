@@ -4,6 +4,14 @@
 
 #include "xc_sr_common.h"
 
+/* Change this to work with bigger VMs *
+ * MAX_P2M_SIZE = VM_mem_size * 1024/4 *
+ * For a 512MB VM, 512 * 256 = 131072. */
+#define MAX_P2M_SIZE 524288
+
+unsigned SENT_MFNS = 0, ITER = 0;
+xen_pfn_t *mfns_to_be_sent;
+
 /*
  * Read and validate the Image and Domain headers.
  */
@@ -136,7 +144,7 @@ int populate_pfns(struct xc_sr_context *ctx, unsigned count,
 {
     xc_interface *xch = ctx->xch;
     xen_pfn_t *mfns = malloc(count * sizeof(*mfns)),
-        *pfns = malloc(count * sizeof(*pfns));
+    *pfns = malloc(count * sizeof(*pfns));
     unsigned i, nr_pfns = 0;
     int rc = -1;
 
@@ -182,6 +190,9 @@ int populate_pfns(struct xc_sr_context *ctx, unsigned count,
             }
 
             ctx->restore.ops.set_gfn(ctx, pfns[i], mfns[i]);
+            ITER = pfns[i];
+            mfns_to_be_sent[ITER] = mfns[i];
+            ctx->restore.nr_mfns++;
         }
     }
 
@@ -209,7 +220,8 @@ static int process_page_data(struct xc_sr_context *ctx, unsigned count,
     void *mapping = NULL, *guest_page = NULL;
     unsigned i,    /* i indexes the pfns from the record. */
         j,         /* j indexes the subset of pfns we decide to map. */
-        nr_pages = 0;
+        nr_pages = 0,
+        page_diff = 0;
 
     if ( !mfns || !map_errs )
     {
@@ -222,102 +234,106 @@ static int process_page_data(struct xc_sr_context *ctx, unsigned count,
     rc = populate_pfns(ctx, count, pfns, types);
     if ( rc )
     {
-        ERROR("Failed to populate pfns for batch of %u pages", count);
-        goto err;
+	    ERROR("Failed to populate pfns for batch of %u pages", count);
+	    goto err;
     }
 
     for ( i = 0; i < count; ++i )
     {
-        ctx->restore.ops.set_page_type(ctx, pfns[i], types[i]);
+	    ctx->restore.ops.set_page_type(ctx, pfns[i], types[i]);
 
-        switch ( types[i] )
-        {
-        case XEN_DOMCTL_PFINFO_NOTAB:
+	    switch ( types[i] )
+	    {
+		    case XEN_DOMCTL_PFINFO_NOTAB:
 
-        case XEN_DOMCTL_PFINFO_L1TAB:
-        case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
+		    case XEN_DOMCTL_PFINFO_L1TAB:
+		    case XEN_DOMCTL_PFINFO_L1TAB | XEN_DOMCTL_PFINFO_LPINTAB:
 
-        case XEN_DOMCTL_PFINFO_L2TAB:
-        case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
+		    case XEN_DOMCTL_PFINFO_L2TAB:
+		    case XEN_DOMCTL_PFINFO_L2TAB | XEN_DOMCTL_PFINFO_LPINTAB:
 
-        case XEN_DOMCTL_PFINFO_L3TAB:
-        case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
+		    case XEN_DOMCTL_PFINFO_L3TAB:
+		    case XEN_DOMCTL_PFINFO_L3TAB | XEN_DOMCTL_PFINFO_LPINTAB:
 
-        case XEN_DOMCTL_PFINFO_L4TAB:
-        case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
+		    case XEN_DOMCTL_PFINFO_L4TAB:
+		    case XEN_DOMCTL_PFINFO_L4TAB | XEN_DOMCTL_PFINFO_LPINTAB:
 
-            mfns[nr_pages++] = ctx->restore.ops.pfn_to_gfn(ctx, pfns[i]);
-            break;
-        }
+			    mfns[nr_pages++] = ctx->restore.ops.pfn_to_gfn(ctx, pfns[i]);
+			    break;
+	    }
     }
 
     /* Nothing to do? */
     if ( nr_pages == 0 )
-        goto done;
+	    goto done;
 
     mapping = guest_page = xenforeignmemory_map(xch->fmem,
-        ctx->domid, PROT_READ | PROT_WRITE,
-        nr_pages, mfns, map_errs);
+		    ctx->domid, PROT_READ | PROT_WRITE,
+		    nr_pages, mfns, map_errs);
     if ( !mapping )
     {
-        rc = -1;
-        PERROR("Unable to map %u mfns for %u pages of data",
-               nr_pages, count);
-        goto err;
+	    rc = -1;
+	    PERROR("Unable to map %u mfns for %u pages of data",
+			    nr_pages, count);
+	    goto err;
     }
 
     for ( i = 0, j = 0; i < count; ++i )
     {
-        switch ( types[i] )
-        {
-        case XEN_DOMCTL_PFINFO_XTAB:
-        case XEN_DOMCTL_PFINFO_BROKEN:
-        case XEN_DOMCTL_PFINFO_XALLOC:
-            /* No page data to deal with. */
-            continue;
-        }
+	    switch ( types[i] )
+	    {
+		    case XEN_DOMCTL_PFINFO_XTAB:
+		    case XEN_DOMCTL_PFINFO_BROKEN:
+		    case XEN_DOMCTL_PFINFO_XALLOC:
+			    /* No page data to deal with. */
+			    continue;
+	    }
 
-        if ( map_errs[j] )
-        {
-            rc = -1;
-            ERROR("Mapping pfn %#"PRIpfn" (mfn %#"PRIpfn", type %#"PRIx32") failed with %d",
-                  pfns[i], mfns[j], types[i], map_errs[j]);
-            goto err;
-        }
+	    if ( map_errs[j] )
+	    {
+		    rc = -1;
+		    ERROR("Mapping pfn %#"PRIpfn" (mfn %#"PRIpfn", type %#"PRIx32") failed with %d",
+				    pfns[i], mfns[j], types[i], map_errs[j]);
+		    goto err;
+	    }
 
-        /* Undo page normalisation done by the saver. */
-        rc = ctx->restore.ops.localise_page(ctx, types[i], page_data);
-        if ( rc )
-        {
-            ERROR("Failed to localise pfn %#"PRIpfn" (type %#"PRIx32")",
-                  pfns[i], types[i] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
-            goto err;
-        }
+	    /* Undo page normalisation done by the saver. */
+	    rc = ctx->restore.ops.localise_page(ctx, types[i], page_data);
+	    if ( rc )
+	    {
+		    ERROR("Failed to localise pfn %#"PRIpfn" (type %#"PRIx32")",
+				    pfns[i], types[i] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
+		    goto err;
+	    }
 
-        if ( ctx->restore.verify )
-        {
-            /* Verify mode - compare incoming data to what we already have. */
-            if ( memcmp(guest_page, page_data, PAGE_SIZE) )
-                ERROR("verify pfn %#"PRIpfn" failed (type %#"PRIx32")",
-                      pfns[i], types[i] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
-        }
-        else
-        {
-            /* Regular mode - copy incoming data into place. */
-            memcpy(guest_page, page_data, PAGE_SIZE);
-        }
+	    if ( ctx->restore.verify )
+	    {
+		    /* Verify mode - compare incoming data to what we already have. */
+		    if ( memcmp(guest_page, page_data, PAGE_SIZE) )
+			    ERROR("verify pfn %#"PRIpfn" failed (type %#"PRIx32")",
+					    pfns[i], types[i] >> XEN_DOMCTL_PFINFO_LTAB_SHIFT);
+	    }
+	    else
+	    {
+		    if (SENT_MFNS)
+			    if (memcmp(guest_page, page_data, PAGE_SIZE))
+				    page_diff++;
+		    /* Regular mode - copy incoming data into place. */
+		    memcpy(guest_page, page_data, PAGE_SIZE);
+	    }
 
-        ++j;
-        guest_page += PAGE_SIZE;
-        page_data += PAGE_SIZE;
+	    ++j;
+	    guest_page += PAGE_SIZE;
+	    page_data += PAGE_SIZE;
     }
 
- done:
+    //fprintf(stderr, "SR: restore: nr pages different: %u\n", page_diff);
+done:
     rc = 0;
 
- err:
+err:
     if ( mapping )
-        xenforeignmemory_unmap(xch->fmem, mapping, nr_pages);
+	    xenforeignmemory_unmap(xch->fmem, mapping, nr_pages);
 
     free(map_errs);
     free(mfns);
@@ -331,84 +347,84 @@ static int process_page_data(struct xc_sr_context *ctx, unsigned count,
  */
 static int handle_page_data(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 {
-    xc_interface *xch = ctx->xch;
-    struct xc_sr_rec_page_data_header *pages = rec->data;
-    unsigned i, pages_of_data = 0;
-    int rc = -1;
+	xc_interface *xch = ctx->xch;
+	struct xc_sr_rec_page_data_header *pages = rec->data;
+	unsigned i, pages_of_data = 0;
+	int rc = -1;
 
-    xen_pfn_t *pfns = NULL, pfn;
-    uint32_t *types = NULL, type;
+	xen_pfn_t *pfns = NULL, pfn;
+	uint32_t *types = NULL, type;
 
-    if ( rec->length < sizeof(*pages) )
-    {
-        ERROR("PAGE_DATA record truncated: length %u, min %zu",
-              rec->length, sizeof(*pages));
-        goto err;
-    }
-    else if ( pages->count < 1 )
-    {
-        ERROR("Expected at least 1 pfn in PAGE_DATA record");
-        goto err;
-    }
-    else if ( rec->length < sizeof(*pages) + (pages->count * sizeof(uint64_t)) )
-    {
-        ERROR("PAGE_DATA record (length %u) too short to contain %u"
-              " pfns worth of information", rec->length, pages->count);
-        goto err;
-    }
+	if ( rec->length < sizeof(*pages) )
+	{
+		ERROR("PAGE_DATA record truncated: length %u, min %zu",
+				rec->length, sizeof(*pages));
+		goto err;
+	}
+	else if ( pages->count < 1 )
+	{
+		ERROR("Expected at least 1 pfn in PAGE_DATA record");
+		goto err;
+	}
+	else if ( rec->length < sizeof(*pages) + (pages->count * sizeof(uint64_t)) )
+	{
+		ERROR("PAGE_DATA record (length %u) too short to contain %u"
+				" pfns worth of information", rec->length, pages->count);
+		goto err;
+	}
 
-    pfns = malloc(pages->count * sizeof(*pfns));
-    types = malloc(pages->count * sizeof(*types));
-    if ( !pfns || !types )
-    {
-        ERROR("Unable to allocate enough memory for %u pfns",
-              pages->count);
-        goto err;
-    }
+	pfns = malloc(pages->count * sizeof(*pfns));
+	types = malloc(pages->count * sizeof(*types));
+	if ( !pfns || !types )
+	{
+		ERROR("Unable to allocate enough memory for %u pfns",
+				pages->count);
+		goto err;
+	}
 
-    for ( i = 0; i < pages->count; ++i )
-    {
-        pfn = pages->pfn[i] & PAGE_DATA_PFN_MASK;
-        if ( !ctx->restore.ops.pfn_is_valid(ctx, pfn) )
-        {
-            ERROR("pfn %#"PRIpfn" (index %u) outside domain maximum", pfn, i);
-            goto err;
-        }
+	for ( i = 0; i < pages->count; ++i )
+	{
+		pfn = pages->pfn[i] & PAGE_DATA_PFN_MASK;
+		if ( !ctx->restore.ops.pfn_is_valid(ctx, pfn) )
+		{
+			ERROR("pfn %#"PRIpfn" (index %u) outside domain maximum", pfn, i);
+			goto err;
+		}
 
-        type = (pages->pfn[i] & PAGE_DATA_TYPE_MASK) >> 32;
-        if ( ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
-             ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8) )
-        {
-            ERROR("Invalid type %#"PRIx32" for pfn %#"PRIpfn" (index %u)",
-                  type, pfn, i);
-            goto err;
-        }
-        else if ( type < XEN_DOMCTL_PFINFO_BROKEN )
-            /* NOTAB and all L1 through L4 tables (including pinned) should
-             * have a page worth of data in the record. */
-            pages_of_data++;
+		type = (pages->pfn[i] & PAGE_DATA_TYPE_MASK) >> 32;
+		if ( ((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) >= 5) &&
+				((type >> XEN_DOMCTL_PFINFO_LTAB_SHIFT) <= 8) )
+		{
+			ERROR("Invalid type %#"PRIx32" for pfn %#"PRIpfn" (index %u)",
+					type, pfn, i);
+			goto err;
+		}
+		else if ( type < XEN_DOMCTL_PFINFO_BROKEN )
+			/* NOTAB and all L1 through L4 tables (including pinned) should
+			 * have a page worth of data in the record. */
+			pages_of_data++;
 
-        pfns[i] = pfn;
-        types[i] = type;
-    }
+		pfns[i] = pfn;
+		types[i] = type;
+	}
 
-    if ( rec->length != (sizeof(*pages) +
-                         (sizeof(uint64_t) * pages->count) +
-                         (PAGE_SIZE * pages_of_data)) )
-    {
-        ERROR("PAGE_DATA record wrong size: length %u, expected "
-              "%zu + %zu + %lu", rec->length, sizeof(*pages),
-              (sizeof(uint64_t) * pages->count), (PAGE_SIZE * pages_of_data));
-        goto err;
-    }
+	if ( rec->length != (sizeof(*pages) +
+				(sizeof(uint64_t) * pages->count) +
+				(PAGE_SIZE * pages_of_data)) )
+	{
+		ERROR("PAGE_DATA record wrong size: length %u, expected "
+				"%zu + %zu + %lu", rec->length, sizeof(*pages),
+				(sizeof(uint64_t) * pages->count), (PAGE_SIZE * pages_of_data));
+		goto err;
+	}
 
-    rc = process_page_data(ctx, pages->count, pfns, types,
-                           &pages->pfn[pages->count]);
- err:
-    free(types);
-    free(pfns);
+	rc = process_page_data(ctx, pages->count, pfns, types,
+			&pages->pfn[pages->count]);
+err:
+	free(types);
+	free(pfns);
 
-    return rc;
+	return rc;
 }
 
 /*
@@ -416,316 +432,345 @@ static int handle_page_data(struct xc_sr_context *ctx, struct xc_sr_record *rec)
  */
 static int send_checkpoint_dirty_pfn_list(struct xc_sr_context *ctx)
 {
-    xc_interface *xch = ctx->xch;
-    int rc = -1;
-    unsigned count, written;
-    uint64_t i, *pfns = NULL;
-    struct iovec *iov = NULL;
-    xc_shadow_op_stats_t stats = { 0, ctx->restore.p2m_size };
-    struct xc_sr_record rec =
-    {
-        .type = REC_TYPE_CHECKPOINT_DIRTY_PFN_LIST,
-    };
-    DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
-                                    &ctx->restore.dirty_bitmap_hbuf);
+	xc_interface *xch = ctx->xch;
+	int rc = -1;
+	unsigned count, written;
+	uint64_t i, *pfns = NULL;
+	struct iovec *iov = NULL;
+	xc_shadow_op_stats_t stats = { 0, ctx->restore.p2m_size };
+	struct xc_sr_record rec =
+	{
+		.type = REC_TYPE_CHECKPOINT_DIRTY_PFN_LIST,
+	};
+	DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
+			&ctx->restore.dirty_bitmap_hbuf);
 
-    if ( xc_shadow_control(
-             xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
-             HYPERCALL_BUFFER(dirty_bitmap), ctx->restore.p2m_size,
-             NULL, 0, &stats) != ctx->restore.p2m_size )
-    {
-        PERROR("Failed to retrieve logdirty bitmap");
-        goto err;
-    }
+	if ( xc_shadow_control(
+				xch, ctx->domid, XEN_DOMCTL_SHADOW_OP_CLEAN,
+				HYPERCALL_BUFFER(dirty_bitmap), ctx->restore.p2m_size,
+				NULL, 0, &stats) != ctx->restore.p2m_size )
+	{
+		PERROR("Failed to retrieve logdirty bitmap");
+		goto err;
+	}
 
-    for ( i = 0, count = 0; i < ctx->restore.p2m_size; i++ )
-    {
-        if ( test_bit(i, dirty_bitmap) )
-            count++;
-    }
+	for ( i = 0, count = 0; i < ctx->restore.p2m_size; i++ )
+	{
+		if ( test_bit(i, dirty_bitmap) )
+			count++;
+	}
 
 
-    pfns = malloc(count * sizeof(*pfns));
-    if ( !pfns )
-    {
-        ERROR("Unable to allocate %zu bytes of memory for dirty pfn list",
-              count * sizeof(*pfns));
-        goto err;
-    }
+	pfns = malloc(count * sizeof(*pfns));
+	if ( !pfns )
+	{
+		ERROR("Unable to allocate %zu bytes of memory for dirty pfn list",
+				count * sizeof(*pfns));
+		goto err;
+	}
 
-    for ( i = 0, written = 0; i < ctx->restore.p2m_size; ++i )
-    {
-        if ( !test_bit(i, dirty_bitmap) )
-            continue;
+	for ( i = 0, written = 0; i < ctx->restore.p2m_size; ++i )
+	{
+		if ( !test_bit(i, dirty_bitmap) )
+			continue;
 
-        if ( written > count )
-        {
-            ERROR("Dirty pfn list exceed");
-            goto err;
-        }
+		if ( written > count )
+		{
+			ERROR("Dirty pfn list exceed");
+			goto err;
+		}
 
-        pfns[written++] = i;
-    }
+		pfns[written++] = i;
+	}
 
-    /* iovec[] for writev(). */
-    iov = malloc(3 * sizeof(*iov));
-    if ( !iov )
-    {
-        ERROR("Unable to allocate memory for sending dirty bitmap");
-        goto err;
-    }
+	/* iovec[] for writev(). */
+	iov = malloc(3 * sizeof(*iov));
+	if ( !iov )
+	{
+		ERROR("Unable to allocate memory for sending dirty bitmap");
+		goto err;
+	}
 
-    rec.length = count * sizeof(*pfns);
+	rec.length = count * sizeof(*pfns);
 
-    iov[0].iov_base = &rec.type;
-    iov[0].iov_len = sizeof(rec.type);
+	iov[0].iov_base = &rec.type;
+	iov[0].iov_len = sizeof(rec.type);
 
-    iov[1].iov_base = &rec.length;
-    iov[1].iov_len = sizeof(rec.length);
+	iov[1].iov_base = &rec.length;
+	iov[1].iov_len = sizeof(rec.length);
 
-    iov[2].iov_base = pfns;
-    iov[2].iov_len = count * sizeof(*pfns);
+	iov[2].iov_base = pfns;
+	iov[2].iov_len = count * sizeof(*pfns);
 
-    if ( writev_exact(ctx->restore.send_back_fd, iov, 3) )
-    {
-        PERROR("Failed to write dirty bitmap to stream");
-        goto err;
-    }
+	if ( writev_exact(ctx->restore.send_back_fd, iov, 3) )
+	{
+		PERROR("Failed to write dirty bitmap to stream");
+		goto err;
+	}
 
-    rc = 0;
- err:
-    free(pfns);
-    free(iov);
-    return rc;
+	rc = 0;
+err:
+	free(pfns);
+	free(iov);
+	return rc;
+}
+
+static int send_mfns_to_primary(struct xc_sr_context *ctx)
+{
+	unsigned i;
+	FILE *fp;
+    unsigned nr_mfns = ctx->restore.nr_mfns;
+	fp = fopen("/tmp/test.txt", "w+");
+
+	fprintf(fp, "%d\n", ctx->domid);
+	for (i = 0; i < nr_mfns; ++i)
+		fprintf(fp, "%ld\n", mfns_to_be_sent[i]);
+	fclose(fp);
+
+    free(mfns_to_be_sent);
+    /* Should properly error check */
+	return 0;
 }
 
 static int process_record(struct xc_sr_context *ctx, struct xc_sr_record *rec);
 static int handle_checkpoint(struct xc_sr_context *ctx)
 {
-    xc_interface *xch = ctx->xch;
-    int rc = 0, ret;
-    unsigned i;
+	xc_interface *xch = ctx->xch;
+	int rc = 0, ret;
+	unsigned i;
 
-    if ( !ctx->restore.checkpointed )
-    {
-        ERROR("Found checkpoint in non-checkpointed stream");
-        rc = -1;
-        goto err;
-    }
+	if ( !ctx->restore.checkpointed )
+	{
+		ERROR("Found checkpoint in non-checkpointed stream");
+		rc = -1;
+		goto err;
+	}
 
-    ret = ctx->restore.callbacks->checkpoint(ctx->restore.callbacks->data);
-    switch ( ret )
-    {
-    case XGR_CHECKPOINT_SUCCESS:
-        break;
+	ret = ctx->restore.callbacks->checkpoint(ctx->restore.callbacks->data);
+	switch ( ret )
+	{
+		case XGR_CHECKPOINT_SUCCESS:
+			break;
 
-    case XGR_CHECKPOINT_FAILOVER:
-        if ( ctx->restore.buffer_all_records )
-            rc = BROKEN_CHANNEL;
-        else
-            /* We don't have a consistent state */
-            rc = -1;
-        goto err;
+		case XGR_CHECKPOINT_FAILOVER:
+			if ( ctx->restore.buffer_all_records )
+			{
+				rc = BROKEN_CHANNEL;
 
-    default: /* Other fatal error */
-        rc = -1;
-        goto err;
-    }
+		ret = ctx->restore.callbacks->suspend(ctx->restore.callbacks->data);
+			}
+			else
+				/* We don't have a consistent state */
+				rc = -1;
+			goto err;
 
-    if ( ctx->restore.buffer_all_records )
-    {
-        IPRINTF("All records buffered");
+		default: /* Other fatal error */
+			rc = -1;
+			goto err;
+	}
 
-        for ( i = 0; i < ctx->restore.buffered_rec_num; i++ )
-        {
-            rc = process_record(ctx, &ctx->restore.buffered_records[i]);
-            if ( rc )
-                goto err;
-        }
-        ctx->restore.buffered_rec_num = 0;
-        IPRINTF("All records processed");
-    }
-    else
-        ctx->restore.buffer_all_records = true;
+	if(!SENT_MFNS)
+	{
+		if( send_mfns_to_primary(ctx) )
+			DPRINTF("SR: Failed to send mfns to primary");
+		SENT_MFNS = 1;
+	}
 
-    if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
-    {
+	if ( ctx->restore.buffer_all_records )
+	{
+		IPRINTF("All records buffered");
+
+		for ( i = 0; i < ctx->restore.buffered_rec_num; i++ )
+		{
+			rc = process_record(ctx, &ctx->restore.buffered_records[i]);
+			if ( rc )
+				goto err;
+		}
+		ctx->restore.buffered_rec_num = 0;
+		IPRINTF("All records processed");
+	}
+	else
+		ctx->restore.buffer_all_records = true;
+
+	if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
+	{
 #define HANDLE_CALLBACK_RETURN_VALUE(ret)                   \
-    do {                                                    \
-        if ( ret == 1 )                                     \
-            rc = 0; /* Success */                           \
-        else                                                \
-        {                                                   \
-            if ( ret == 2 )                                 \
-                rc = BROKEN_CHANNEL;                        \
-            else                                            \
-                rc = -1; /* Some unspecified error */       \
-            goto err;                                       \
-        }                                                   \
-    } while (0)
+		do {                                                    \
+			if ( ret == 1 )                                     \
+			rc = 0; /* Success */                           \
+			else                                                \
+			{                                                   \
+				if ( ret == 2 )                                 \
+				rc = BROKEN_CHANNEL;                        \
+				else                                            \
+				rc = -1; /* Some unspecified error */       \
+				goto err;                                       \
+			}                                                   \
+		} while (0)
 
-        /* COLO */
+		/* COLO */
 
-        /* We need to resume guest */
-        rc = ctx->restore.ops.stream_complete(ctx);
-        if ( rc )
-            goto err;
+		/* We need to resume guest */
+		rc = ctx->restore.ops.stream_complete(ctx);
+		if ( rc )
+			goto err;
 
-        ctx->restore.callbacks->restore_results(ctx->restore.xenstore_gfn,
-                                                ctx->restore.console_gfn,
-                                                ctx->restore.callbacks->data);
+		ctx->restore.callbacks->restore_results(ctx->restore.xenstore_gfn,
+				ctx->restore.console_gfn,
+				ctx->restore.callbacks->data);
 
-        /* Resume secondary vm */
-        ret = ctx->restore.callbacks->postcopy(ctx->restore.callbacks->data);
-        HANDLE_CALLBACK_RETURN_VALUE(ret);
+		/* Resume secondary vm */
+		ret = ctx->restore.callbacks->postcopy(ctx->restore.callbacks->data);
+		HANDLE_CALLBACK_RETURN_VALUE(ret);
 
-        /* Wait for a new checkpoint */
-        ret = ctx->restore.callbacks->wait_checkpoint(
-                                                ctx->restore.callbacks->data);
-        HANDLE_CALLBACK_RETURN_VALUE(ret);
+		/* Wait for a new checkpoint */
+		ret = ctx->restore.callbacks->wait_checkpoint(
+				ctx->restore.callbacks->data);
+		HANDLE_CALLBACK_RETURN_VALUE(ret);
 
-        /* suspend secondary vm */
-        ret = ctx->restore.callbacks->suspend(ctx->restore.callbacks->data);
-        HANDLE_CALLBACK_RETURN_VALUE(ret);
+		/* suspend secondary vm */
+		ret = ctx->restore.callbacks->suspend(ctx->restore.callbacks->data);
+		HANDLE_CALLBACK_RETURN_VALUE(ret);
 
 #undef HANDLE_CALLBACK_RETURN_VALUE
 
-        rc = send_checkpoint_dirty_pfn_list(ctx);
-        if ( rc )
-            goto err;
-    }
+		rc = send_checkpoint_dirty_pfn_list(ctx);
+		if ( rc )
+			goto err;
+	}
 
- err:
-    return rc;
+err:
+	return rc;
 }
 
 static int buffer_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 {
-    xc_interface *xch = ctx->xch;
-    unsigned new_alloc_num;
-    struct xc_sr_record *p;
+	xc_interface *xch = ctx->xch;
+	unsigned new_alloc_num;
+	struct xc_sr_record *p;
 
-    if ( ctx->restore.buffered_rec_num >= ctx->restore.allocated_rec_num )
-    {
-        new_alloc_num = ctx->restore.allocated_rec_num + DEFAULT_BUF_RECORDS;
-        p = realloc(ctx->restore.buffered_records,
-                    new_alloc_num * sizeof(struct xc_sr_record));
-        if ( !p )
-        {
-            ERROR("Failed to realloc memory for buffered records");
-            return -1;
-        }
+	if ( ctx->restore.buffered_rec_num >= ctx->restore.allocated_rec_num )
+	{
+		new_alloc_num = ctx->restore.allocated_rec_num + DEFAULT_BUF_RECORDS;
+		p = realloc(ctx->restore.buffered_records,
+				new_alloc_num * sizeof(struct xc_sr_record));
+		if ( !p )
+		{
+			ERROR("Failed to realloc memory for buffered records");
+			return -1;
+		}
 
-        ctx->restore.buffered_records = p;
-        ctx->restore.allocated_rec_num = new_alloc_num;
-    }
+		ctx->restore.buffered_records = p;
+		ctx->restore.allocated_rec_num = new_alloc_num;
+	}
 
-    memcpy(&ctx->restore.buffered_records[ctx->restore.buffered_rec_num++],
-           rec, sizeof(*rec));
+	memcpy(&ctx->restore.buffered_records[ctx->restore.buffered_rec_num++],
+			rec, sizeof(*rec));
 
-    return 0;
+	return 0;
 }
 
 static int process_record(struct xc_sr_context *ctx, struct xc_sr_record *rec)
 {
-    xc_interface *xch = ctx->xch;
-    int rc = 0;
+	xc_interface *xch = ctx->xch;
+	int rc = 0;
 
-    switch ( rec->type )
-    {
-    case REC_TYPE_END:
-        break;
+	switch ( rec->type )
+	{
+		case REC_TYPE_END:
+			break;
 
-    case REC_TYPE_PAGE_DATA:
-        rc = handle_page_data(ctx, rec);
-        break;
+		case REC_TYPE_PAGE_DATA:
+			rc = handle_page_data(ctx, rec);
+			break;
 
-    case REC_TYPE_VERIFY:
-        DPRINTF("Verify mode enabled");
-        ctx->restore.verify = true;
-        break;
+		case REC_TYPE_VERIFY:
+			DPRINTF("Verify mode enabled");
+			ctx->restore.verify = true;
+			break;
 
-    case REC_TYPE_CHECKPOINT:
-        rc = handle_checkpoint(ctx);
-        break;
+		case REC_TYPE_CHECKPOINT:
+			rc = handle_checkpoint(ctx);
+			break;
 
-    default:
-        rc = ctx->restore.ops.process_record(ctx, rec);
-        break;
-    }
+		default:
+			rc = ctx->restore.ops.process_record(ctx, rec);
+			break;
+	}
 
-    free(rec->data);
-    rec->data = NULL;
+	free(rec->data);
+	rec->data = NULL;
 
-    return rc;
+	return rc;
 }
 
 static int setup(struct xc_sr_context *ctx)
 {
-    xc_interface *xch = ctx->xch;
-    int rc;
-    DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
-                                    &ctx->restore.dirty_bitmap_hbuf);
+	xc_interface *xch = ctx->xch;
+	int rc;
+	DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
+			&ctx->restore.dirty_bitmap_hbuf);
 
-    if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
-    {
-        dirty_bitmap = xc_hypercall_buffer_alloc_pages(xch, dirty_bitmap,
-                                NRPAGES(bitmap_size(ctx->restore.p2m_size)));
+	if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
+	{
+		dirty_bitmap = xc_hypercall_buffer_alloc_pages(xch, dirty_bitmap,
+				NRPAGES(bitmap_size(ctx->restore.p2m_size)));
 
-        if ( !dirty_bitmap )
-        {
-            ERROR("Unable to allocate memory for dirty bitmap");
-            rc = -1;
-            goto err;
-        }
-    }
+		if ( !dirty_bitmap )
+		{
+			ERROR("Unable to allocate memory for dirty bitmap");
+			rc = -1;
+			goto err;
+		}
+	}
 
-    rc = ctx->restore.ops.setup(ctx);
-    if ( rc )
-        goto err;
+	rc = ctx->restore.ops.setup(ctx);
+	if ( rc )
+		goto err;
 
-    ctx->restore.max_populated_pfn = (32 * 1024 / 4) - 1;
-    ctx->restore.populated_pfns = bitmap_alloc(
-        ctx->restore.max_populated_pfn + 1);
-    if ( !ctx->restore.populated_pfns )
-    {
-        ERROR("Unable to allocate memory for populated_pfns bitmap");
-        rc = -1;
-        goto err;
-    }
+	ctx->restore.max_populated_pfn = (32 * 1024 / 4) - 1;
+	ctx->restore.populated_pfns = bitmap_alloc(
+			ctx->restore.max_populated_pfn + 1);
+	if ( !ctx->restore.populated_pfns )
+	{
+		ERROR("Unable to allocate memory for populated_pfns bitmap");
+		rc = -1;
+		goto err;
+	}
 
-    ctx->restore.buffered_records = malloc(
-        DEFAULT_BUF_RECORDS * sizeof(struct xc_sr_record));
-    if ( !ctx->restore.buffered_records )
-    {
-        ERROR("Unable to allocate memory for buffered records");
-        rc = -1;
-        goto err;
-    }
-    ctx->restore.allocated_rec_num = DEFAULT_BUF_RECORDS;
+	ctx->restore.buffered_records = malloc(
+			DEFAULT_BUF_RECORDS * sizeof(struct xc_sr_record));
+	if ( !ctx->restore.buffered_records )
+	{
+		ERROR("Unable to allocate memory for buffered records");
+		rc = -1;
+		goto err;
+	}
+	ctx->restore.allocated_rec_num = DEFAULT_BUF_RECORDS;
 
- err:
-    return rc;
+err:
+	return rc;
 }
 
 static void cleanup(struct xc_sr_context *ctx)
 {
-    xc_interface *xch = ctx->xch;
-    unsigned i;
-    DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
-                                    &ctx->restore.dirty_bitmap_hbuf);
+	xc_interface *xch = ctx->xch;
+	unsigned i;
+	DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
+			&ctx->restore.dirty_bitmap_hbuf);
 
-    for ( i = 0; i < ctx->restore.buffered_rec_num; i++ )
-        free(ctx->restore.buffered_records[i].data);
+	for ( i = 0; i < ctx->restore.buffered_rec_num; i++ )
+		free(ctx->restore.buffered_records[i].data);
 
-    if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
-        xc_hypercall_buffer_free_pages(xch, dirty_bitmap,
-                                   NRPAGES(bitmap_size(ctx->restore.p2m_size)));
-    free(ctx->restore.buffered_records);
-    free(ctx->restore.populated_pfns);
-    if ( ctx->restore.ops.cleanup(ctx) )
-        PERROR("Failed to clean up");
+	if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
+		xc_hypercall_buffer_free_pages(xch, dirty_bitmap,
+				NRPAGES(bitmap_size(ctx->restore.p2m_size)));
+	free(ctx->restore.buffered_records);
+	free(ctx->restore.populated_pfns);
+	if ( ctx->restore.ops.cleanup(ctx) )
+		PERROR("Failed to clean up");
 }
+
 
 /*
  * Restore a domain.
@@ -735,56 +780,58 @@ static int restore(struct xc_sr_context *ctx)
     xc_interface *xch = ctx->xch;
     struct xc_sr_record rec;
     int rc, saved_rc = 0, saved_errno = 0;
-
     IPRINTF("Restoring domain");
 
     rc = setup(ctx);
     if ( rc )
-        goto err;
+    	goto err;
 
     do
     {
-        rc = read_record(ctx, ctx->fd, &rec);
-        if ( rc )
-        {
-            if ( ctx->restore.buffer_all_records )
-                goto remus_failover;
-            else
-                goto err;
-        }
-
-        if ( ctx->restore.buffer_all_records &&
-             rec.type != REC_TYPE_END &&
-             rec.type != REC_TYPE_CHECKPOINT )
-        {
-            rc = buffer_record(ctx, &rec);
-            if ( rc )
-                goto err;
-        }
+    rc = read_record(ctx, ctx->fd, &rec);
+    if ( rc )
+    {
+        if ( ctx->restore.buffer_all_records )
+            goto remus_failover;
         else
+            goto err;
+    }
+   if ( ctx->restore.buffer_all_records &&
+         rec.type != REC_TYPE_END &&
+         rec.type != REC_TYPE_CHECKPOINT )
+    {
+        rc = buffer_record(ctx, &rec);
+        if ( rc )
+            goto err;
+    }
+    else
+    {
+        rc = process_record(ctx, &rec);
+        if ( rc == RECORD_NOT_PROCESSED )
         {
-            rc = process_record(ctx, &rec);
-            if ( rc == RECORD_NOT_PROCESSED )
+            if ( rec.type & REC_TYPE_OPTIONAL )
+                DPRINTF("Ignoring optional record %#x (%s)",
+                        rec.type, rec_type_to_str(rec.type));
+            else
             {
-                if ( rec.type & REC_TYPE_OPTIONAL )
-                    DPRINTF("Ignoring optional record %#x (%s)",
-                            rec.type, rec_type_to_str(rec.type));
-                else
-                {
-                    ERROR("Mandatory record %#x (%s) not handled",
-                          rec.type, rec_type_to_str(rec.type));
-                    rc = -1;
-                    goto err;
-                }
-            }
-            else if ( rc == BROKEN_CHANNEL )
-                goto remus_failover;
-            else if ( rc )
+                ERROR("Mandatory record %#x (%s) not handled",
+                      rec.type, rec_type_to_str(rec.type));
+                rc = -1;
                 goto err;
+            }
         }
-
+        else if ( rc == BROKEN_CHANNEL )
+	{
+	    fprintf(stderr, "REMUS: Value of rc if rc == BROKEN_CHANNEL: %d\n", rc);
+            goto remus_failover;
+	}
+        else if ( rc )
+            goto err;
+        //WRITE_COUNTER++;
+        //if ( WRITE_COUNTER > 200)
+            //write_mfns_to_file(ctx);
+    }
     } while ( rec.type != REC_TYPE_END );
-
  remus_failover:
 
     if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
@@ -822,7 +869,49 @@ static int restore(struct xc_sr_context *ctx)
 
     return rc;
 }
+#if 0
+int vm_rollback(struct xc_sr_context *ctx)
+{
+    xc_interface *xch = ctx->xch;
+    int rc, saved_rc = 0, saved_errno = 0;
+    if ( ctx->restore.checkpointed == XC_MIG_STREAM_COLO )
+    {
+        /* With COLO, we have already called stream_complete */
+        rc = 0;
+        IPRINTF("COLO Failover");
+        goto done;
+    }
 
+    /*
+     * With Remus, if we reach here, there must be some error on primary,
+     * failover from the last checkpoint state.
+     */
+    rc = ctx->restore.ops.stream_complete(ctx);
+    if ( rc )
+        goto err;
+
+    IPRINTF("Restore successful");
+    return rc;
+
+ done:
+    cleanup(ctx);
+
+    if ( saved_rc )
+    {
+        rc = saved_rc;
+        errno = saved_errno;
+    }
+    return rc;
+
+ err:
+    saved_errno = errno;
+    saved_rc = rc;
+    PERROR("Restore failed");
+
+
+    return rc;
+}
+#endif
 int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
                       unsigned int store_evtchn, unsigned long *store_mfn,
                       domid_t store_domid, unsigned int console_evtchn,
@@ -888,6 +977,11 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
     }
 
     ctx.restore.p2m_size = nr_pfns;
+    ctx.restore.nr_mfns = 0;
+    mfns_to_be_sent = malloc(MAX_P2M_SIZE * sizeof(*mfns_to_be_sent));
+
+    if ( !mfns_to_be_sent )
+        return 0;
 
     if ( ctx.dominfo.hvm )
     {

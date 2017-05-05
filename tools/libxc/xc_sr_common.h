@@ -211,6 +211,11 @@ struct xc_sr_context
             unsigned long nr_deferred_pages;
             xc_hypercall_buffer_t dirty_bitmap_hbuf;
 
+            /* Memcpy related parameters */
+            int read_mfns;
+            uint32_t bckp_domid;
+            unsigned long *bckp_mfns;
+
         } save;
 
         struct /* Restore data. */
