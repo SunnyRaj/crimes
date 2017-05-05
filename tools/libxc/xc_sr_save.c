@@ -265,7 +265,6 @@ static int memcpy_write_batch(struct xc_sr_context *ctx)
     {
         nr_pages_mapped = nr_pages;
 
-
         for ( i = 0, p = 0; i < nr_pfns; ++i )
         {
             switch ( types[i] )
@@ -615,30 +614,42 @@ static int send_dirty_pages(struct xc_sr_context *ctx,
                             unsigned long entries)
 {
     xc_interface *xch = ctx->xch;
-    xen_pfn_t p;
+    xen_pfn_t p, q, curr_bit;
     unsigned long written;
     int rc;
+    xen_pfn_t sz_c = sizeof(int) * 8;
+
     DECLARE_HYPERCALL_BUFFER_SHADOW(unsigned long, dirty_bitmap,
                                     &ctx->save.dirty_bitmap_hbuf);
+
+    int *bmp = (int *)dirty_bitmap;
 
     DPRINTF("SR: p2m size is %ld", ctx->save.p2m_size);
 
     DPRINTF("Time at sr_add2batch_start %lld ns", ns_timer());
-    for ( p = 0, written = 0; p < ctx->save.p2m_size; ++p )
+
+    for ( p = 0, written = 0; p < ctx->save.p2m_size/sz_c; ++p )
     {
-        if ( !test_bit(p, dirty_bitmap) )
+        if (bmp[p] == 0)
             continue;
 
-        rc = add_to_batch(ctx, p);
-        if ( rc )
-            return rc;
+        for ( q = 0; q < sz_c; ++q )
+        {
+            curr_bit = ( p * sz_c ) + q;
+            if ( !test_bit(curr_bit, dirty_bitmap) )
+                continue;
 
-        /* Update progress every 4MB worth of memory sent. */
-        if ( (written & ((1U << (22 - 12)) - 1)) == 0 )
-            xc_report_progress_step(xch, written, entries);
+            rc = add_to_batch(ctx, curr_bit);
+            if ( rc )
+                return rc;
 
-        ++written;
-   }
+            /* Update progress every 4MB worth of memory sent. */
+            if ( (written & ((1U << (22 - 12)) - 1)) == 0 )
+                xc_report_progress_step(xch, written, entries);
+
+            ++written;
+        }
+    }
 
     DPRINTF("Time at sr_add2batch_end %lld ns", ns_timer());
 
