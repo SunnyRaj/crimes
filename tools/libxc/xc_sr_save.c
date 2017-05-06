@@ -21,15 +21,21 @@
 #include <libvmi/libvmi.h>
 #include "xc_pipe.h"
 
+#include <sys/time.h>
+
 /* Backup VM memcpy related variables */
 unsigned nr_end_checkpoint = 0;
 
+struct timeval tv;
+
 /* LibVMI related variables */
-//#define ENABLE_LIBVMI  //comment to disable VMI
+#define ENABLE_LIBVMI  //comment to disable VMI
 int counter = 1;
 int buf;
 int xen_write_fd = 0;             //Linux Pipe 1
 int xen_read_fd = 0;            //Linux Pipe 2
+
+int nr_checkpoints = 0;
 
 struct vmi_requirements vmi_req;
 
@@ -880,7 +886,7 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
 #ifdef ENABLE_LIBVMI
     char * xen_write_ff = NULL;
     char * xen_read_ff = NULL;
-    char* start_addr = "ffff88001d669177";  //subject to change frequently
+    char* start_addr = "f7b103fa080";  //subject to change frequently
 //    char* end_addr = "ffff88001d66917b";    //subject to change frequently
 #endif
 
@@ -907,7 +913,7 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
      *  Convert hexa address into uint64
      */
     DPRINTF("Start Address: %s\n", start_addr);
-    *(vmi_req.st_addr) = 37433400;//(uint64_t) strtoul(start_addr, NULL, 16);    /* Have to get the address printed in the malloc code */
+    *(vmi_req.st_addr) = 35090488;//(uint64_t) strtoul(start_addr, NULL, 20);    /* Have to get the address printed in the malloc code */
     DPRINTF("Starting Address in unsigned long int: %" PRIu64 "\n", *(vmi_req.st_addr));
 /*
     DPRINTF("End Address: %s\n", end_addr);
@@ -917,8 +923,8 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
 /*-------------------------------------------------------------------------------------*/
     if (counter == 1)
     {
-	xen_write_ff = "/tmp/xen_to_vmi";        //Linux Pipe
-	xen_read_ff = "/tmp/vmi_to_xen";
+	xen_write_ff = "/home/sundarcs/xen_to_vmi";        //Linux Pipe
+	xen_read_ff = "/home/sundarcs/vmi_to_xen";
         mkfifo(xen_read_ff, 0666);        //Create Pipe 2
         xen_write_fd = open(xen_write_ff, O_WRONLY);      //Open Pipe 1 for Write
         xen_read_fd = open(xen_read_ff, O_RDONLY);      //open Pipe 2 for Read
@@ -968,6 +974,13 @@ static int suspend_and_send_dirty(struct xc_sr_context *ctx)
     	return 100;
     }
     counter = 2;
+#endif
+#ifndef ENABLE_LIBVMI
+    if(nr_checkpoints == 100)
+    {
+	return 100;
+    }
+	nr_checkpoints++;
 #endif
 
     if ( xc_shadow_control(
@@ -1180,6 +1193,7 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
 {
     xc_interface *xch = ctx->xch;
     int rc, saved_rc = 0, saved_errno = 0;
+    unsigned long long time;
 
     IPRINTF("Saving domain %d, type %s",
             ctx->domid, dhdr_type_to_str(guest_type));
@@ -1222,7 +1236,11 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
 
         if (rc == 100)
         {
-            rc = system ("sudo xl pause opensuse64");    //pause the primary
+            rc = system ("sudo xl pause ubuntu-hvm");    //pause the primary
+	    gettimeofday(&tv, NULL);
+	    time = tv.tv_sec * 1000000 + tv.tv_usec;
+	    printf("Timestamp at which the primary is paused %llu\n", (unsigned long long) time);
+
             return 100;
         }
 
@@ -1308,13 +1326,16 @@ static int save(struct xc_sr_context *ctx, uint16_t guest_type)
 
    } while ( ctx->save.checkpointed != XC_MIG_STREAM_NONE );
 
-   xc_report_progress_single(xch, "End of stream");
-   rc = write_end_record(ctx);
-   if ( rc )
+    xc_report_progress_single(xch, "End of stream");
+    rc = write_end_record(ctx);
+    gettimeofday(&tv, NULL);
+    time = tv.tv_sec * 1000000 + tv.tv_usec;
+    printf("Timestamp where failover begins %llu\n", (unsigned long long) time);
+    if ( rc )
         goto err;
     rc = 100;
     xc_report_progress_single(xch, "Complete");
-   goto done;
+    goto done;
 
  err:
     saved_errno = errno;
